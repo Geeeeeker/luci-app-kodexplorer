@@ -22,7 +22,7 @@ jobs:
           python3 <<EOF
           import subprocess, json, os, uuid
 
-          # 生成密钥和 ID
+          # 生成密钥
           result = subprocess.check_output(["xray", "x25519"]).decode("utf-8").split('\n')
           priv = result[0].split(': ')[1].strip()
           pub = result[1].split(': ')[1].strip()
@@ -44,9 +44,10 @@ jobs:
               "outbounds": [{"protocol": "freedom"}]
           }
 
-          with open("config.json", "w") as f: json.dump(config, f)
+          # 使用绝对路径写入
+          config_path = os.path.join(os.getcwd(), "config.json")
+          with open(config_path, "w") as f: json.dump(config, f)
           
-          # 仅存储最简单的变量，避开复杂拼接
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f"uuid={u_id}\n")
               f.write(f"pub={pub}\n")
@@ -57,10 +58,18 @@ jobs:
         env:
           NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
-          sudo xray -c config.json &
+          # 1. 强制清理 443 端口（防止预装服务占用）
+          sudo fuser -k 443/tcp || true
+          
+          # 2. 启动 Xray 并记录详细日志
+          sudo xray -c $GITHUB_WORKSPACE/config.json > xray_debug.log 2>&1 &
+          
+          # 3. 启动 ngrok
           ngrok config add-authtoken $NGROK_AUTHTOKEN
           ngrok tcp 443 --log=stdout > ngrok.log &
-          sleep 15
+          
+          # 4. 延长等待时间，确保连接建立
+          sleep 20
 
       - name: Final Output Link
         env:
@@ -68,20 +77,29 @@ jobs:
           MY_PUB: ${{ steps.vars.outputs.pub }}
           MY_SID: ${{ steps.vars.outputs.sid }}
         run: |
-          # 使用环境变量进行拼接，彻底避开 YAML 解析错误
+          # 检查 Xray 是否还在运行
+          if ! pgrep xray > /dev/null; then
+            echo "❌ Xray 启动失败，调试日志如下："
+            cat xray_debug.log
+            exit 1
+          fi
+
           TCP_ADDR=$(grep -o 'tcp://[-a-zA-Z0-9.]*:[0-9]*' ngrok.log | sed 's/tcp:\/\///')
-          if [ -z "$TCP_ADDR" ]; then echo "Tunnel failed!"; exit 1; fi
+          if [ -z "$TCP_ADDR" ]; then
+            echo "❌ Ngrok 隧道建立失败，日志如下："
+            cat ngrok.log
+            exit 1
+          fi
           
           ADDR=$(echo $TCP_ADDR | cut -d':' -f1)
           PORT=$(echo $TCP_ADDR | cut -d':' -f2)
           
-          # 在 Shell 中拼接链接
-          LINK="vless://${MY_UUID}@${ADDR}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${MY_PUB}&sid=${MY_SID}#Reality-Safe"
+          LINK="vless://${MY_UUID}@${ADDR}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${MY_PUB}&sid=${MY_SID}#Reality-Action"
           
           echo "=================================================="
           echo "✅ 部署成功！"
           echo "--------------------------------------------------"
-          echo "手机一键导入链接 (复制全文):"
+          echo "手机/电脑一键导入链接:"
           echo "$LINK"
           echo "--------------------------------------------------"
           echo "地址: $ADDR"
