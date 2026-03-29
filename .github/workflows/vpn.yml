@@ -11,83 +11,87 @@ jobs:
 
       - name: Install Xray & ngrok
         run: |
-          # 1. 使用 sudo 安装 Xray
+          # 安装 Xray
           curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh | sudo bash -s -- install
-          
-          # 2. 安装 ngrok
+          # 安装 ngrok
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
           sudo apt update && sudo apt install ngrok
 
-      - name: Generate Reality Config
+      - name: Generate Reality Config (Stable Python Method)
         id: vars
         run: |
-          # 生成运行参数
-          UUID=$(xray uuid)
-          KEYS=$(xray x25519)
-          PRIVATE_KEY=$(echo "$KEYS" | sed -n '1p' | awk '{print $3}')
-          PUBLIC_KEY=$(echo "$KEYS" | sed -n '2p' | awk '{print $3}')
-          SHORT_ID=$(openssl rand -hex 8)
-          
-          echo "uuid=$UUID" >> $GITHUB_OUTPUT
-          echo "pub=$PUBLIC_KEY" >> $GITHUB_OUTPUT
-          echo "sid=$SHORT_ID" >> $GITHUB_OUTPUT
+          # 使用 Python 确保密钥生成和文件写入 100% 正确
+          python3 <<EOF
+          import subprocess, json, os, uuid
 
-          # 写入配置文件
-          cat <<EOF > config.json
-          {
-            "inbounds": [{
-              "port": 443,
-              "protocol": "vless",
-              "settings": {
-                "clients": [{"id": "$UUID", "flow": "xtls-rprx-vision"}],
-                "decryption": "none"
-              },
-              "streamSettings": {
-                "network": "tcp",
-                "security": "reality",
-                "realitySettings": {
-                  "show": false,
-                  "dest": "www.microsoft.com:443",
-                  "xver": 0,
-                  "serverNames": ["www.microsoft.com"],
-                  "privateKey": "$PRIVATE_KEY",
-                  "shortIds": ["$SHORT_ID"]
-                }
-              }
-            }],
-            "outbounds": [{"protocol": "freedom"}]
+          # 调用 xray 生成密钥
+          result = subprocess.check_output(["xray", "x25519"]).decode("utf-8")
+          lines = result.split('\n')
+          private_key = lines[0].split(': ')[1].strip()
+          public_key = lines[1].split(': ')[1].strip()
+          user_id = str(uuid.uuid4())
+          short_id = os.urandom(4).hex()
+
+          config = {
+              "inbounds": [{
+                  "port": 443,
+                  "protocol": "vless",
+                  "settings": {
+                      "clients": [{"id": user_id, "flow": "xtls-rprx-vision"}],
+                      "decryption": "none"
+                  },
+                  "streamSettings": {
+                      "network": "tcp",
+                      "security": "reality",
+                      "realitySettings": {
+                          "show": False,
+                          "dest": "www.microsoft.com:443",
+                          "xver": 0,
+                          "serverNames": ["www.microsoft.com"],
+                          "privateKey": private_key,
+                          "shortIds": [short_id]
+                      }
+                  }
+              }],
+              "outbounds": [{"protocol": "freedom"}]
           }
+
+          with open("config.json", "w") as f:
+              json.dump(config, f, indent=2)
+
+          # 输出给 GitHub Actions 变量
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"uuid={user_id}\n")
+              f.write(f"pub={public_key}\n")
+              f.write(f"sid={short_id}\n")
           EOF
 
       - name: Start Services
         env:
           NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
+          # 验证配置文件是否存在
+          if [ ! -f config.json ]; then echo "Config file missing!"; exit 1; fi
+          
           # 启动服务
           sudo xray -c config.json &
+          
+          # 启动 ngrok
+          if [ -z "$NGROK_AUTHTOKEN" ]; then echo "NGROK_AUTHTOKEN is empty!"; exit 1; fi
           ngrok config add-authtoken $NGROK_AUTHTOKEN
           ngrok tcp 443 --log=stdout > ngrok.log &
+          
           sleep 10
 
       - name: Final Output Link
         run: |
+          # 提取 ngrok 地址
           TCP_ADDR=$(grep -o 'tcp://[-a-zA-Z0-9.]*:[0-9]*' ngrok.log | sed 's/tcp:\/\///')
+          if [ -z "$TCP_ADDR" ]; then echo "FRP/ngrok failed to start"; cat ngrok.log; exit 1; fi
+          
           ADDR=$(echo $TCP_ADDR | cut -d':' -f1)
           PORT=$(echo $TCP_ADDR | cut -d':' -f2)
           UUID="${{ steps.vars.outputs.uuid }}"
           PUB="${{ steps.vars.outputs.pub }}"
-          SID="${{ steps.vars.outputs.sid }}"
-          
-          # 拼接 Reality 一键导入链接
-          LINK="vless://$UUID@$ADDR:$PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=$PUB&sid=$SID#GFW-Killer"
-          
-          echo "=================================================="
-          echo "✅ 部署成功！"
-          echo "--------------------------------------------------"
-          echo "一键导入链接 (直接复制到 v2rayNG/Shadowrocket):"
-          echo "$LINK"
-          echo "--------------------------------------------------"
-          echo "地址: $ADDR"
-          echo "端口: $PORT"
-          echo "=================================================="
+          SID="${{ steps
