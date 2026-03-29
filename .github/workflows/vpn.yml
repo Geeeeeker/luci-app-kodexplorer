@@ -1,75 +1,49 @@
-name: VPN Server Deployment
+name: VPN Server with Auto-Public-URL
 on:
-  workflow_dispatch: # 手动触发
+  workflow_dispatch:
 
 jobs:
-  deploy-vpn:
+  deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup VPN Server (IPsec/IKEv2)
+      - name: Install VPN & Tools
         run: |
-          # 运行 IPsec VPN 容器
+          # 1. 安装 localtunnel (用于公网映射)
+          sudo npm install -g localtunnel
+          
+          # 2. 启动 VPN 容器
           docker run \
             --name ipsec-vpn-server \
-            --env-file <(printenv | grep VPN_) \
-            --restart=always \
             -p 500:500/udp \
             -p 4500:4500/udp \
+            -e VPN_USER=root \
+            -e VPN_PASSWORD=passwd \
+            -e VPN_IPSEC_PSK=1 \
             -d --privileged \
             hwdsl2/ipsec-vpn-server
-        env:
-          VPN_USER: root
-          VPN_PASSWORD: passwd
-          VPN_IPSEC_PSK: "1" # 您要求的 IPsec 标志符 (PSK)
 
-      - name: Setup Status Monitor (Port 5656)
+      - name: Start 5656 Monitor
         run: |
-          # 创建一个简单的 Python 监控脚本
-          cat <<EOF > monitor.py
+          # 启动 Python 监控并在后台运行
+          python3 -c "
           from http.server import BaseHTTPRequestHandler, HTTPServer
           import subprocess
-
-          class Handler(BaseHTTPRequestHandler):
+          class H(BaseHTTPRequestHandler):
               def do_GET(self):
                   self.send_response(200)
                   self.send_header('Content-type', 'text/plain; charset=utf-8')
                   self.end_headers()
-                  status = "VPN Server is Running\n"
-                  status += "Auth: IKEv2/IPsec\n"
-                  status += "User: root\n"
-                  self.wfile.write(status.encode())
+                  ip = subprocess.getoutput('curl -s https://api.ipify.org')
+                  info = f'--- VPN STATUS ---\nStatus: Running\nUser: root\nPass: passwd\nPSK: 1\nPublic IP: {ip}\nPorts: 500/UDP, 4500/UDP\n'
+                  self.wfile.write(info.encode())
+          HTTPServer(('0.0.0.0', 5656), H).serve_forever()" &
 
-          print("Starting monitor on port 5656...")
-          HTTPServer(('0.0.0.0', 5656), Handler).serve_forever()
-          EOF
-          
-          # 后台运行监控服务
-          python3 monitor.py &
-
-      - name: Print Connection Information
+      - name: Expose Monitor to Public Web
         run: |
-          echo "### 部署信息 (Deployment Info) ###"
+          echo "------------------------------------------------------"
+          echo "正在生成公网访问链接..."
+          echo "注意：点击链接后，如果提示输入 IP，请输入：$(curl -s https://api.ipify.org)"
+          echo "------------------------------------------------------"
           
-          # 获取当前公网 IP
-          PUBLIC_IP=$(curl -s https://api.ipify.org)
-          
-          # 获取 GitHub 提供的默认域名 (仅当前 Runner 有效)
-          HOSTNAME=$(hostname -f)
-
-          echo "-----------------------------------"
-          echo "公网 IP 地址: $PUBLIC_IP"
-          echo "主机域名: $HOSTNAME"
-          echo "VPN 端口: 500/UDP, 4500/UDP"
-          echo "Web 监控端口: 5656"
-          echo "-----------------------------------"
-          echo "IPsec PSK: 1"
-          echo "用户名: root"
-          echo "密码: passwd"
-          echo "-----------------------------------"
-          
-          # 保持工作流运行一段时间以便测试（GitHub Action 默认会在任务结束后销毁环境）
-          echo "服务已就绪，保持运行 1 小时..."
-          sleep 3600
+          # 启动隧道并将输出打印到日志
+          lt --port 5656
