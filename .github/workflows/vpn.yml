@@ -1,4 +1,4 @@
-name: Ultimate-Reality-Proxy
+name: Reality-LocalTunnel-Proxy
 on:
   workflow_dispatch:
 
@@ -9,14 +9,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Xray & ngrok
+      - name: Install Xray & LocalTunnel
         run: |
           # 1. 安装 Xray
           curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh | sudo bash -s -- install
-          # 2. 安装 ngrok
-          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
-          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
-          sudo apt update && sudo apt install ngrok
+          # 2. 安装 Node.js 和 LocalTunnel (lt)
+          sudo apt-get update
+          sudo apt-get install -y nodejs npm
+          sudo npm install -g localtunnel
 
       - name: Generate Reality Config
         id: vars
@@ -24,15 +24,10 @@ jobs:
           python3 <<EOF
           import subprocess, json, os, uuid
 
-          # 获取密钥
-          try:
-              result = subprocess.check_output(["xray", "x25519"]).decode("utf-8").split('\n')
-              priv = result[0].split(': ')[1].strip()
-              pub = result[1].split(': ')[1].strip()
-          except Exception as e:
-              print(f"Error generating keys: {e}")
-              exit(1)
-
+          # 生成 Reality 密钥
+          result = subprocess.check_output(["xray", "x25519"]).decode("utf-8").split('\n')
+          priv = result[0].split(': ')[1].strip()
+          pub = result[1].split(': ')[1].strip()
           u_id = str(uuid.uuid4())
           s_id = os.urandom(4).hex()
 
@@ -51,7 +46,6 @@ jobs:
               "outbounds": [{"protocol": "freedom"}]
           }
 
-          # 强制写入当前工作目录
           with open("config.json", "w") as f:
               json.dump(config, f)
           
@@ -60,29 +54,16 @@ jobs:
           EOF
 
       - name: Start Services
-        env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
-          # 1. 检查配置文件是否真的存在
-          if [ ! -f "config.json" ]; then
-            echo "❌ 错误：config.json 未生成！"
-            exit 1
-          fi
-
-          # 2. 释放端口并启动 Xray (使用当前目录的绝对路径)
+          # 1. 清理端口并启动 Xray
           sudo fuser -k 443/tcp || true
-          CONF_PATH=$(pwd)/config.json
-          echo "使用配置文件: $CONF_PATH"
+          sudo xray run -c "$(pwd)/config.json" > xray_debug.log 2>&1 &
           
-          # 启动并把错误输出到文件
-          sudo xray run -c "$CONF_PATH" > xray_debug.log 2>&1 &
+          # 2. 使用 LocalTunnel 转发 443 端口
+          # 注意：lt 默认转发到随机子域名
+          lt --port 443 > lt.log 2>&1 &
           
-          # 3. 启动 ngrok
-          if [ -z "$NGROK_AUTHTOKEN" ]; then echo "❌ 错误：NGROK_AUTHTOKEN 为空"; exit 1; fi
-          ngrok config add-authtoken "$NGROK_AUTHTOKEN"
-          ngrok tcp 443 --log=stdout > ngrok.log &
-          
-          sleep 20
+          sleep 15
 
       - name: Final Output Link
         env:
@@ -92,28 +73,31 @@ jobs:
         run: |
           # 检查 Xray 状态
           if ! pgrep xray > /dev/null; then
-            echo "❌ Xray 启动后崩溃，错误详情："
             cat xray_debug.log
             exit 1
           fi
 
-          # 提取地址
-          TCP_ADDR=$(grep -o 'tcp://[-a-zA-Z0-9.]*:[0-9]*' ngrok.log | sed 's/tcp:\/\///')
-          if [ -z "$TCP_ADDR" ]; then
-            echo "❌ Ngrok 启动失败，日志如下："
-            cat ngrok.log
+          # 提取 LocalTunnel 域名
+          LT_URL=$(grep -o 'https://[a-zA-Z0-9-]*\.loca\.lt' lt.log | sed 's/https:\/\///')
+          if [ -z "$LT_URL" ]; then
+            echo "❌ LocalTunnel 启动失败，可能是服务端拥堵，请稍后重试。"
+            cat lt.log
             exit 1
           fi
           
-          ADDR=$(echo $TCP_ADDR | cut -d':' -f1)
-          PORT=$(echo $TCP_ADDR | cut -d':' -f2)
-          
-          LINK="vless://${MY_UUID}@${ADDR}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${MY_PUB}&sid=${MY_SID}#Reality-Final"
+          # 拼接 Reality 链接
+          # 注意：LocalTunnel 转发的是 HTTP/HTTPS 隧道，
+          # 对于 Reality 这种原生 TCP 协议，我们需要客户端支持通过域名 SNI 连接
+          LINK="vless://${MY_UUID}@${LT_URL}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${MY_PUB}&sid=${MY_SID}#Reality-LocalTunnel"
           
           echo "=================================================="
-          echo "✅ 部署成功！"
+          echo "✅ 部署成功！(基于 LocalTunnel)"
+          echo "--------------------------------------------------"
           echo "一键导入链接:"
           echo "$LINK"
+          echo "--------------------------------------------------"
+          echo "提醒：LocalTunnel 域名在大陆部分地区可能不稳定"
+          echo "如果连不上，请尝试重新运行 Workflow 更换域名"
           echo "=================================================="
           
           sleep 21600
