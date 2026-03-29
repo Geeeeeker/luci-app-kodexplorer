@@ -1,16 +1,9 @@
-name: Ultimate Security - VLESS Reality
-on:
-  workflow_dispatch:
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Install Xray & ngrok
+- name: Install Xray & ngrok
         run: |
-          # 安装 Xray
-          bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-          # 安装 ngrok
+          # 1. 使用 sudo 执行 Xray 安装脚本
+          curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh | sudo bash -s -- install
+          
+          # 2. 安装 ngrok (这些步骤通常已经带了 sudo)
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
           sudo apt update && sudo apt install ngrok
@@ -18,18 +11,18 @@ jobs:
       - name: Generate Reality Keys & Config
         id: vars
         run: |
-          # 生成 Reality 专用的私钥和公钥
-          KEYS=$(xray uuid && xray x25519)
-          UUID=$(echo "$KEYS" | sed -n '1p')
-          PRIVATE_KEY=$(echo "$KEYS" | sed -n '2p' | awk '{print $3}')
-          PUBLIC_KEY=$(echo "$KEYS" | sed -n '3p' | awk '{print $3}')
+          # 生成 UUID 和 密钥对 (这些不需要 sudo)
+          UUID=$(xray uuid)
+          KEYS=$(xray x25519)
+          PRIVATE_KEY=$(echo "$KEYS" | sed -n '1p' | awk '{print $3}')
+          PUBLIC_KEY=$(echo "$KEYS" | sed -n '2p' | awk '{print $3}')
           SHORT_ID=$(openssl rand -hex 8)
           
           echo "uuid=$UUID" >> $GITHUB_OUTPUT
           echo "pub=$PUBLIC_KEY" >> $GITHUB_OUTPUT
           echo "sid=$SHORT_ID" >> $GITHUB_OUTPUT
 
-          # 配置 Xray (借用微软的域名)
+          # 写入配置文件
           cat <<EOF > config.json
           {
             "inbounds": [{
@@ -55,36 +48,16 @@ jobs:
             "outbounds": [{"protocol": "freedom"}]
           }
           EOF
-          sudo xray -c config.json &
 
-      - name: Start TCP Tunnel
+      - name: Start Services
         env:
           NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
+          # 1. 启动 Xray (必须用 sudo，因为要监听 443 端口)
+          sudo xray -c config.json &
+          
+          # 2. 配置并启动 ngrok
           ngrok config add-authtoken $NGROK_AUTHTOKEN
-          # 转发 TCP 443 端口
           ngrok tcp 443 --log=stdout > ngrok.log &
+          
           sleep 10
-
-      - name: Final Output
-        run: |
-          TCP_ADDR=$(grep -o 'tcp://[-a-zA-Z0-9.]*:[0-9]*' ngrok.log | sed 's/tcp:\/\///')
-          ADDR=$(echo $TCP_ADDR | cut -d':' -f1)
-          PORT=$(echo $TCP_ADDR | cut -d':' -f2)
-          
-          echo "=================================================="
-          echo "🔒 VLESS-Reality 安全连接 (天花板级别)"
-          echo "--------------------------------------------------"
-          echo "地址 (Address): $ADDR"
-          echo "端口 (Port): $PORT"
-          echo "用户 ID (UUID): ${{ steps.vars.outputs.uuid }}"
-          echo "传输协议 (Network): tcp"
-          echo "流控 (Flow): xtls-rprx-vision"
-          echo "底层传输安全 (TLS): reality"
-          echo "SNI (Server Name): www.microsoft.com"
-          echo "公钥 (PublicKey): ${{ steps.vars.outputs.pub }}"
-          echo "ShortID: ${{ steps.vars.outputs.sid }}"
-          echo "Fingerprint: chrome"
-          echo "=================================================="
-          
-          sleep 21600
