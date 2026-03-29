@@ -1,49 +1,114 @@
-name: VPN Server with Auto-Public-URL
+name: VPN with Auto-FRP Tunnel
 on:
   workflow_dispatch:
 
 jobs:
-  deploy:
+  deploy-vpn:
     runs-on: ubuntu-latest
     steps:
-      - name: Install VPN & Tools
-        run: |
-          # 1. 安装 localtunnel (用于公网映射)
-          sudo npm install -g localtunnel
-          
-          # 2. 启动 VPN 容器
-          docker run \
-            --name ipsec-vpn-server \
-            -p 500:500/udp \
-            -p 4500:4500/udp \
-            -e VPN_USER=root \
-            -e VPN_PASSWORD=passwd \
-            -e VPN_IPSEC_PSK=1 \
-            -d --privileged \
-            hwdsl2/ipsec-vpn-server
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Start 5656 Monitor
+      - name: Install Tools
         run: |
-          # 启动 Python 监控并在后台运行
+          sudo apt-get update && sudo apt-get install -y jq
+          wget https://github.com/fatedier/frp/releases/download/v0.54.0/frp_0.54.0_linux_amd64.tar.gz
+          tar -zxvf frp_0.54.0_linux_amd64.tar.gz
+          mv frp_0.54.0_linux_amd64/frpc .
+
+      - name: Start VPN and Monitor
+        run: |
+          # 启动 VPN 容器
+          docker run --name ipsec-vpn-server -p 500:500/udp -p 4500:4500/udp \
+            -e VPN_USER=root -e VPN_PASSWORD=passwd -e VPN_IPSEC_PSK=1 \
+            -d --privileged hwdsl2/ipsec-vpn-server
+          
+          # 启动 5656 端口监控
           python3 -c "
           from http.server import BaseHTTPRequestHandler, HTTPServer
-          import subprocess
           class H(BaseHTTPRequestHandler):
               def do_GET(self):
                   self.send_response(200)
-                  self.send_header('Content-type', 'text/plain; charset=utf-8')
                   self.end_headers()
-                  ip = subprocess.getoutput('curl -s https://api.ipify.org')
-                  info = f'--- VPN STATUS ---\nStatus: Running\nUser: root\nPass: passwd\nPSK: 1\nPublic IP: {ip}\nPorts: 500/UDP, 4500/UDP\n'
-                  self.wfile.write(info.encode())
+                  self.wfile.write(b'VPN Runner Active\nUser: root\nPass: passwd\nPSK: 1')
           HTTPServer(('0.0.0.0', 5656), H).serve_forever()" &
 
-      - name: Expose Monitor to Public Web
+      - name: Dynamic Port Allocation & Start FRP
+        id: frp_setup
         run: |
-          echo "------------------------------------------------------"
-          echo "正在生成公网访问链接..."
-          echo "注意：点击链接后，如果提示输入 IP，请输入：$(curl -s https://api.ipify.org)"
-          echo "------------------------------------------------------"
+          python3 <<EOF
+          import random, time, os, subprocess
+
+          def generate_frpc_config(prefix, web_p, vpn_500, vpn_4500):
+              config = f"""
+          serverAddr = "frp4.freefrp.net"
+          serverPort = 7000
+          auth.token = "freefrp.net"
+
+          [[proxies]]
+          name = "{prefix}-web"
+          type = "tcp"
+          localIP = "127.0.0.1"
+          localPort = 5656
+          remotePort = {web_p}
+
+          [[proxies]]
+          name = "{prefix}-500"
+          type = "udp"
+          localIP = "127.0.0.1"
+          localPort = 500
+          remotePort = {vpn_500}
+
+          [[proxies]]
+          name = "{prefix}-4500"
+          type = "udp"
+          localIP = "127.0.0.1"
+          localPort = 4500
+          remotePort = {vpn_4500}
+          """
+              with open("frpc.toml", "w") as f:
+                  f.write(config)
+
+          # 生成随机前缀防止 Proxy Name 冲突
+          prefix = "vpn-" + str(random.randint(1000, 9999))
           
-          # 启动隧道并将输出打印到日志
-          lt --port 5656
+          while True:
+              # 在 10001-50000 范围内随机选 3 个端口
+              ports = random.sample(range(10001, 50000), 3)
+              print(f"尝试使用远程端口: Web:{ports[0]}, UDP500:{ports[1]}, UDP4500:{ports[2]}")
+              
+              generate_frpc_config(prefix, ports[0], ports[1], ports[2])
+              
+              # 启动 frpc 并检查是否成功启动（如果不成功通常是端口被占）
+              process = subprocess.Popen(["./frpc", "-c", "frpc.toml"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              time.sleep(5) # 给一点时间连接服务器
+              
+              if process.poll() is None: # 进程仍在运行，说明连接初步成功
+                  print("FRP 连接成功！")
+                  with open("ports.info", "w") as f:
+                      f.write(f"WEB={ports[0]}\nVPN500={ports[1]}\nVPN4500={ports[2]}")
+                  break
+              else:
+                  print("端口冲突或连接失败，正在重试...")
+                  process.kill()
+          EOF
+
+      - name: Print Final Addresses
+        run: |
+          source ports.info
+          PUBLIC_IP=$(curl -s https://api.ipify.org)
+          echo "--------------------------------------------------"
+          echo "✅ 部署成功！"
+          echo "🌍 大陆可访问域名: frp4.freefrp.net"
+          echo "--------------------------------------------------"
+          echo "📡 Web 监控页面: http://frp4.freefrp.net:$WEB"
+          echo "🔑 VPN 端口 (UDP): $VPN500 和 $VPN4500"
+          echo "📍 Runner 公网 IP: $PUBLIC_IP"
+          echo "--------------------------------------------------"
+          echo "账户: root"
+          echo "密码: passwd"
+          echo "PSK:  1"
+          echo "--------------------------------------------------"
+          
+          # 保持运行 6 小时 (GitHub Actions 最大时长限制)
+          sleep 21600
